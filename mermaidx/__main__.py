@@ -73,9 +73,10 @@ examples:
     parser.add_argument("--scale", type=float, default=None, metavar="N",
                         help="Size multiplier, used if -w/-H are omitted (e.g. 2.0)")
     parser.add_argument("-t", "--theme",
-                        choices=["default", "forest", "dark", "neutral"],
-                        default="default",
-                        help="Mermaid theme (default: default)")
+                        choices=["base", "dark", "default", "forest", "neutral", "neo", "neo-dark", "redux",
+                                 "redux-dark", "redux-color", "redux-dark-color", "null"],
+                        default=None,
+                        help="Mermaid theme (default: the one mermaid.js picks, as with mermaid-cli)")
     parser.add_argument("-b", "--background", default=None, metavar="COLOR",
                         help="CSS background color (default: transparent)")
     parser.add_argument("-c", "--config", metavar="FILE",

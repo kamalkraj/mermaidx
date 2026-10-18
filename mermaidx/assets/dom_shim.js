@@ -37,11 +37,60 @@ globalThis.console = {
 // instead of plain string concatenation. Only the two methods mermaid
 // actually calls, plus the `.cssRules` / `.cssText` shape its own
 // `cssStyleSheetToString()` reads back out, are implemented here.
+// A CSSStyleRule: `selectorText` + a live `style` declaration block. mermaid 12's
+// C4 renderer does `rules[insertRule(".x .label {}")].style.setProperty(...)` and
+// later filters on `style.length` before reading `cssText`, so the rule has to be a
+// real, mutable object -- not just a frozen `{ cssText }` snapshot. A rule that is
+// never mutated serializes exactly as before (canonicalized source text).
+class CSSStyleRule {
+  constructor(text) {
+    this._text = __cssCanonRule(text);
+    this._mutated = false;
+    this._decls = new Map();
+    const m = /^\s*([^{}@][^{}]*)\{([^{}]*)\}\s*$/.exec(text);
+    this.selectorText = m ? m[1].trim() : "";
+    if (m) {
+      for (const d of __cssSplitTop(m[2], ";")) {
+        const i = d.indexOf(":");
+        if (i < 0) continue;
+        const name = d.slice(0, i).trim();
+        const value = d.slice(i + 1).trim();
+        if (name && value !== "") this._decls.set(name.startsWith("--") ? name : name.toLowerCase(), value);
+      }
+    }
+    const rule = this;
+    const keys = () => [...rule._decls.keys()];
+    this.style = {
+      get length() { return rule._decls.size; },
+      item(i) { return keys()[i] ?? ""; },
+      getPropertyValue(k) { return rule._decls.get(k) ?? ""; },
+      setProperty(k, v, priority) {
+        if (v === null || v === undefined || v === "") return this.removeProperty(k);
+        const name = k.startsWith("--") ? k : k.toLowerCase();
+        rule._decls.delete(name);
+        rule._decls.set(name, String(v) + (priority === "important" ? " !important" : ""));
+        rule._mutated = true;
+      },
+      removeProperty(k) {
+        const name = k.startsWith("--") ? k : k.toLowerCase();
+        const old = rule._decls.get(name) ?? "";
+        if (rule._decls.delete(name)) rule._mutated = true;
+        return old;
+      },
+      get cssText() { return [...rule._decls].map(([k, v]) => `${k}: ${v};`).join(" "); },
+    };
+  }
+  get cssText() {
+    if (!this._mutated) return this._text;
+    return __cssCanonRule(`${this.selectorText} {${[...this._decls].map(([k, v]) => `${k}:${v}`).join(";")}}`);
+  }
+}
+
 class CSSStyleSheet {
   constructor() { this.cssRules = []; }
   insertRule(ruleText, index) {
     const i = index === undefined ? this.cssRules.length : index;
-    this.cssRules.splice(i, 0, { cssText: __cssCanonRule(ruleText) });
+    this.cssRules.splice(i, 0, new CSSStyleRule(ruleText));
     return i;
   }
   replaceSync(text) {
@@ -53,9 +102,10 @@ class CSSStyleSheet {
       else if (ch === "}" && --depth === 0) { rules.push(cur.trim()); cur = ""; }
     }
     if (cur.trim()) rules.push(cur.trim());
-    this.cssRules = rules.map((r) => ({ cssText: __cssCanonRule(r) }));
+    this.cssRules = rules.map((r) => new CSSStyleRule(r));
   }
 }
+globalThis.CSSStyleRule = CSSStyleRule;
 globalThis.CSSStyleSheet = CSSStyleSheet;
 
 // Minimal crypto.getRandomValues polyfill -- QuickJS has no Web Crypto API
@@ -688,8 +738,22 @@ class Element extends Node {
   get innerHTML() { return __serialize(this, true); }
   set innerHTML(html) { this.childNodes = []; __parseInto(this, html, { namespaces: true }); }
   get outerHTML() { return __serialize(this, false); }
+  // SVGElement.ownerSVGElement: the nearest ancestor <svg> (null for the outermost one), undefined on anything
+  // that is not an SVG element. mermaid reads its id to name the per-diagram drop-shadow filters.
+  get ownerSVGElement() {
+    if (this.namespaceURI !== SVG_NS) return undefined;
+    for (let n = this.parentNode; n; n = n.parentNode) {
+      if (n.nodeType === 1 && n.namespaceURI === SVG_NS && n.tagName === "svg") return n;
+    }
+    return null;
+  }
   // ---- SVG geometry: the important part ----
   getBBox() { return __f32rect(__computeBBox(this)); }
+  // Only SVG geometry elements have getTotalLength(); mermaid 12 probes `typeof el.getTotalLength == "function"`
+  // (neo edges: stroke-dasharray = "0 <arrow> <length - arrows> <arrow>"), so it must stay undefined elsewhere.
+  get getTotalLength() {
+    return this.tagName === "path" ? () => globalThis.__pathLength(this.getAttribute("d") || "") : undefined;
+  }
   getBoundingClientRect() { return __f32rect(this.__boundingClientRect()); }
   __boundingClientRect() {
     // HTML content (foreignObject labels): __measureForeignObject mirrors
@@ -730,9 +794,24 @@ class Element extends Node {
       // max-width:<wrappingWidth> on the label, and only when the measured width
       // comes back EQUAL to it does it switch the label into wrap mode.
       const declW = __pxValue(__inlineStyleProp(this, "width")), maxW = __pxValue(__inlineStyleProp(this, "max-width"));
-      if (declW !== null) w = declW;
-      if (maxW !== null && w > maxW) w = maxW;
-      return { x: 0, y: 0, width: w, height: m.height, top: 0, left: 0, right: w, bottom: m.height };
+      // ...but a table (display:table, which is what wrap mode is) is never narrower than its min-content width,
+      // neither because of `width` nor because of `max-width`: the widest word that has no break opportunity
+      // inside it. "DELIVERY_ADDRESS" wrapped to 120px still measures 141.86. (The first, nowrap/table-cell
+      // measurement has no such floor: it comes back clamped to max-width, which is how mermaid knows to wrap.)
+      const display = String(__inlineStyleProp(this, "display") || "").trim();
+      const floorW = display === "table" ? Math.ceil(__minContentWidth(this, fontSize) * 64) / 64 : 0;
+      const constraint = Math.min(declW === null ? Infinity : declW, maxW === null ? Infinity : maxW);
+      if (declW !== null) w = Math.max(declW, floorW);
+      if (maxW !== null && w > maxW) w = Math.max(maxW, floorW);
+      let height = m.height;
+      if (w > constraint) {
+        // Unbreakable content pushed the box wider than the width it was asked to wrap at, so the lines have to
+        // be counted at the width it actually got (novasvg only sees the requested one and would break the text).
+        const widened = html.replace(/(?<![\w-])(max-width|width)\s*:\s*[\d.]+px/gi, (m0, prop) => `${prop}: ${Math.ceil(w) + 1}px`);
+        height = globalThis.__measureForeignObject(widened, fontSize, "DejaVu Sans",
+          __resolveHtmlFontWeight(this), __resolveHtmlFontStyle(this)).height;
+      }
+      return { x: 0, y: 0, width: w, height, top: 0, left: 0, right: w, bottom: height };
     }
     if (this.nodeType === 1 && (this.tagName === "text" || this.tagName === "tspan")) {
       // An SVG text's client rect is its bounding box (ink rule included), moved into screen space.
@@ -751,6 +830,49 @@ class Element extends Node {
   }
   getScreenCTM() { return { a:1,b:0,c:0,d:1,e:0,f:0, inverse(){return this;}, multiply(){return this;} }; }
   createSVGMatrix() { return this.getScreenCTM(); }
+}
+
+// CSS min-content width of `el` for a single font run: the widest piece of text that has no break opportunity.
+// Break opportunities are white space, <br>, the end of a block and a hyphen between two letters/digits -- except
+// inside `white-space: nowrap|pre` (inline style, inherited), where a whole run of text up to the next forced
+// break is one unbreakable piece, however many spaces it holds.
+const __BLOCK_TAGS = new Set(["p", "div", "li", "ul", "ol", "table", "tr", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre"]);
+function __minContentWidth(el, fontSize) {
+  const weight = __resolveHtmlFontWeight(el), style = __resolveHtmlFontStyle(el);
+  let widest = 0, run = "";
+  const measure = (t) => {
+    if (t === "") return;
+    const w = globalThis.__measureText(t, fontSize, "DejaVu Sans", weight, style);
+    if (w > widest) widest = w;
+  };
+  const flush = () => { measure(run.replace(/^ +| +$/g, "")); run = ""; };
+  const nowrapOf = (n, inherited) => {
+    const ws = String(__inlineStyleProp(n, "white-space") || "").toLowerCase();
+    if (/\b(nowrap|pre)\b/.test(ws) && !/pre-/.test(ws)) return true;
+    return ws.trim() !== "" ? false : inherited;
+  };
+  const walk = (n, nowrap) => {
+    for (const c of n.childNodes) {
+      if (c.nodeType === 3) {
+        const t = String(c.textContent);
+        if (nowrap) { run += t.replace(/[ \t\n\r\f]+/g, " "); continue; }
+        flush();
+        for (const word of t.split(/[ \t\n\r\f]+/)) {
+          for (const part of word.split(/(?<=[A-Za-z0-9]-)(?=[A-Za-z0-9])/)) measure(part);
+        }
+      } else if (c.nodeType === 1) {
+        const tag = String(c.tagName).toLowerCase();
+        if (tag === "br") { flush(); continue; }
+        const block = __BLOCK_TAGS.has(tag);
+        if (block) flush();
+        walk(c, nowrapOf(c, nowrap));
+        if (block) flush();
+      }
+    }
+  };
+  walk(el, nowrapOf(el, false));
+  flush();
+  return widest;
 }
 
 // --- bbox computation --------------------------------------------------
@@ -851,11 +973,9 @@ function __resolveFont(el) {
   while (n && n.nodeType === 1) {
     let nSize, nFamily, nWeight;
 
-    const cssSize = __resolveCssProp(n, "font-size");
+    const [cssSize, cssFamily, cssWeight] = __resolveCssProps(n, __FONT_PROPS); // one pass over the stylesheet
     if (cssSize) nSize = cssSize.trim();
-    const cssFamily = __resolveCssProp(n, "font-family");
     if (cssFamily) nFamily = cssFamily.trim();
-    const cssWeight = __resolveCssProp(n, "font-weight");
     if (cssWeight) nWeight = cssWeight.trim();
 
     const inlSize = __inlineStyleProp(n, "font-size"); if (inlSize) nSize = inlSize;
@@ -930,6 +1050,21 @@ function __resolveCssProp(el, prop) {
     if (prop in rule.decls && __matches(el, rule.selectors)) value = rule.decls[prop];
   }
   return value;
+}
+
+// Several properties at once, in a single pass over the rules: a rule's selectors are tested against `el` once
+// however many of `props` it declares. Same result as one __resolveCssProp per property.
+const __FONT_PROPS = ["font-size", "font-family", "font-weight"];
+function __resolveCssProps(el, props) {
+  const out = props.map(() => null);
+  for (const rule of __getCssRules()) {
+    const d = rule.decls;
+    let any = false;
+    for (let k = 0; k < props.length; k++) if (props[k] in d) { any = true; break; }
+    if (!any || !__matches(el, rule.selectors)) continue;
+    for (let k = 0; k < props.length; k++) if (props[k] in d) out[k] = d[props[k]];
+  }
+  return out;
 }
 
 function __resolveElementSizePx(el, dim) {
@@ -1352,9 +1487,18 @@ function __splitTopLevel(text, isSeparator) {
   parts.push([text.slice(start), ""]);
   return parts;
 }
+// Selector strings are parsed once: __resolveFont tests every rule of mermaid's stylesheet (several hundred
+// selector lists since mermaid 12) against every ancestor of every text it measures, so re-splitting and
+// re-tokenizing the same strings on each call made one getBBox cost ~90ms.
+const __selectorListCache = new Map();
 function __matches(el, sel) {
-  for (const [part] of __splitTopLevel(sel.trim(), (c) => c === ",")) {
-    if (__matchesSimple(el, part.trim())) return true;
+  let chains = __selectorListCache.get(sel);
+  if (chains === undefined) {
+    chains = __splitTopLevel(sel.trim(), (c) => c === ",").map(([part]) => __parseComplex(part.trim()));
+    __selectorListCache.set(sel, chains);
+  }
+  for (const chain of chains) {
+    if (chain.length > 0 && __matchesChain(el, chain, chain.length - 1)) return true;
   }
   return false;
 }
@@ -1394,48 +1538,57 @@ function __matchesSimple(el, sel) {
   const chain = __parseComplex(sel);
   return chain.length > 0 && __matchesChain(el, chain, chain.length - 1);
 }
-function __matchesCompound(el, part) {
-  // :not(...) wraps its own compound selector (itself possibly a
-  // pseudo-class, as in mermaid's own "g:not(:first-child)") that the
-  // flat tokenizer below can't parse through parens -- pull each
-  // :not(...) clause out and evaluate it recursively first, then
-  // tokenize whatever's left as an ordinary compound selector.
+const __compoundCache = new Map();
+function __compileCompound(part) {
+  // :not(...) wraps its own compound selector (itself possibly a pseudo-class, as in mermaid's own
+  // "g:not(:first-child)") that the flat tokenizer below can't parse through parens -- pull each :not(...) clause
+  // out (it is evaluated recursively first), then tokenize whatever is left as an ordinary compound selector.
   const notRe = /:not\(([^()]*)\)/g;
   const notClauses = [];
   let notMatch;
   while ((notMatch = notRe.exec(part))) notClauses.push(notMatch[1]);
-  for (const inner of notClauses) {
-    if (__matchesCompound(el, inner)) return false;
-  }
   const rest = part.replace(notRe, "");
   const re = /(#[\w-]+|\.[\w-]+|\[[^\]]+\]|:[\w-]+|[\w-]+|\*)/g;
+  const tokens = [];
   let m;
   while ((m = re.exec(rest))) {
     const t = m[0];
     if (t === "*") continue;
-    if (t[0] === "#") { if (el.getAttribute("id") !== t.slice(1)) return false; }
-    else if (t[0] === ".") { if (!el.classList.contains(t.slice(1))) return false; }
-    else if (t[0] === ":") {
-      // Pseudo-classes. Only the ones mermaid/d3 actually rely on (mainly
-      // ':first-child', used by `.insert(tag, ':first-child')` to place a
-      // shape's background behind an already-created label) are handled;
-      // an unrecognized pseudo-class fails the match rather than silently
-      // matching everything, matching real querySelector semantics.
+    if (t[0] === "[") tokens.push({ kind: "[", attr: /\[([\w-]+)(?:([~^$*|]?=)"?([^"\]]*)"?)?\]/.exec(t) });
+    else if (t[0] === "#" || t[0] === "." || t[0] === ":") tokens.push({ kind: t[0], name: t.slice(1), raw: t });
+    else tokens.push({ kind: "tag", name: t.toLowerCase() });
+  }
+  return { notClauses, tokens };
+}
+function __matchesCompound(el, part) {
+  let c = __compoundCache.get(part);
+  if (c === undefined) { c = __compileCompound(part); __compoundCache.set(part, c); }
+  for (const inner of c.notClauses) {
+    if (__matchesCompound(el, inner)) return false;
+  }
+  for (const t of c.tokens) {
+    if (t.kind === "#") { if (el.getAttribute("id") !== t.name) return false; }
+    else if (t.kind === ".") { if (!el.classList.contains(t.name)) return false; }
+    else if (t.kind === ":") {
+      // Pseudo-classes. Only the ones mermaid/d3 actually rely on (mainly ':first-child', used by
+      // `.insert(tag, ':first-child')` to place a shape's background behind an already-created label) are
+      // handled; an unrecognized pseudo-class fails the match rather than silently matching everything,
+      // matching real querySelector semantics.
       const siblings = el.parentNode
-        ? el.parentNode.childNodes.filter((c) => c.nodeType === 1)
+        ? el.parentNode.childNodes.filter((n) => n.nodeType === 1)
         : [];
-      if (t === ":first-child") { if (siblings[0] !== el) return false; }
-      else if (t === ":last-child") { if (siblings[siblings.length - 1] !== el) return false; }
+      if (t.raw === ":first-child") { if (siblings[0] !== el) return false; }
+      else if (t.raw === ":last-child") { if (siblings[siblings.length - 1] !== el) return false; }
       else { return false; }
     }
-    else if (t[0] === "[") {
-      const am = /\[([\w-]+)(?:([~^$*|]?=)"?([^"\]]*)"?)?\]/.exec(t);
+    else if (t.kind === "[") {
+      const am = t.attr;
       if (am) {
         const val = el.getAttribute(am[1]);
         if (am[2] === undefined) { if (val === null) return false; }
         else if (val !== am[3]) return false;
       }
-    } else { if ((el.tagName || "").toLowerCase() !== t.toLowerCase()) return false; }
+    } else { if ((el.tagName || "").toLowerCase() !== t.name) return false; }
   }
   return true;
 }
@@ -1443,9 +1596,18 @@ function __walk(root, cb) {
   for (const c of root.childNodes) { if (c.nodeType===1) { cb(c); __walk(c, cb); } }
 }
 function __querySelector(root, sel) {
-  let found = null;
-  __walk(root, (el) => { if (!found && __matches(el, sel)) found = el; });
-  return found;
+  // First match in document order, and stop there: walking the rest of the tree for nothing made every
+  // `document.querySelector("style")` (one per style lookup in __getCssRules) cost the size of the document.
+  const visit = (node) => {
+    for (const c of node.childNodes) {
+      if (c.nodeType !== 1) continue;
+      if (__matches(c, sel)) return c;
+      const inner = visit(c);
+      if (inner !== null) return inner;
+    }
+    return null;
+  };
+  return visit(root);
 }
 function __querySelectorAll(root, sel) {
   const out = [];
@@ -1705,6 +1867,17 @@ for (const prop of ["parentNode", "childNodes"]) {
     set(v) { Object.defineProperty(this, prop, { value: v, writable: true, enumerable: true, configurable: true }); },
   });
 }
+// A browser's nodeType is an accessor on Node.prototype. DOMPurify (inside mermaid.js) relies on that: its
+// isNode() is `typeof lookupGetter(Node.prototype, "nodeType")(value) === "number"`, so with a plain per-instance
+// property it answered false for every node and its mXSS guard (`!isNode(el.firstElementChild)`) then removed any
+// <svg> whose text merely contains "<x" -- e.g. the entity-escaped "<<Element>>" label of a requirement diagram --
+// which left mermaid.render() returning "". The value still lives on the instance (as with parentNode above), so
+// reading `el.nodeType` stays a plain property read in the hot loops.
+Object.defineProperty(Node.prototype, "nodeType", {
+  configurable: true,
+  get() { const d = Object.getOwnPropertyDescriptor(this, "nodeType"); return d ? d.value : undefined; },
+  set(v) { Object.defineProperty(this, "nodeType", { value: v, writable: true, enumerable: true, configurable: true }); },
+});
 Object.defineProperties(Node.prototype, {
   nodeName: { configurable: true, get() { return this.nodeType === 3 ? "#text" : this.nodeType === 9 ? "#document" : this.tagName; } },
 });

@@ -19,7 +19,19 @@ BACKENDS = ("quickjs", "v8")
 
 # (backend, sample) -> why it differs from mmdc. strict xfail: the day one of these starts to match, the test fails
 # and the entry has to go.
+_C4_REASON = (
+    "mermaid 12's C4 text blocks come out 0.06 px wider than in Chrome (`translate(-72.1789, ..)` against "
+    "`translate(-72.1172, ..)`), \"Internet Banking System\" wraps after \"Internet Banking\" here and not in the reference, "
+    "and the layout then differs. What was measured outside mermaid, with Chrome 153's getComputedTextLength() on the "
+    "same font: at 11, 12, 14 and 13.44 px the shim's text width is within 0.02 px, at the fractional 11.48 px of the "
+    "description text Chrome is about 0.09 % narrower than a linear scaling of the font size. That measurement used "
+    "the default arguments of @sparticuz/chromium, not the flags of the reference recipe, so this is where to look, "
+    "not an established cause."
+)
+
 KNOWN_DIFFERENT = {
+    ("quickjs", "24_c4_context"): _C4_REASON,
+    ("v8", "24_c4_context"): _C4_REASON,
     ("v8", "39_mindmap_shapes"): (
         "cose-bilkent runs one cooling cycle more than with quickjs. Math.sin of mini-racer's V8 differs by 1 ulp "
         "from quickjs/libm (sin(-5.969026041820607), sin(0.5569781975426904)); replaying quickjs's Math.sin results "

@@ -574,7 +574,7 @@ class Diagram(DiagramBase):
     def _svg(self) -> str:
         engine = _get_engine_by_name(self.backend)  # raises ImportError first if backend="v8" but unavailable
         try:
-            return engine.render_svg(self._source, self._theme or "default", self._config, self._css)
+            return engine.render_svg(self._source, self._theme, self._config, self._css)
         except MermaidRenderError as e:
             raise RuntimeError(f"Mermaid rendering failed: {e}") from e
 

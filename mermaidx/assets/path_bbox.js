@@ -176,7 +176,99 @@ globalThis.__pathBBox = (function () {
 
   // ---- path building + SkPath::computeTightBounds -----------------------------------------------------
 
-  return function pathBBox(d) {
+  // Walks `d` the way Blink builds its SkPath and reports every piece to the handlers h.move/line/quad/cubic/conic
+  // (and h.close, optional). Shared by getBBox and getTotalLength so both see exactly the same path.
+  function walk(d, h) {
+    let cx = 0, cy = 0, startX = 0, startY = 0;
+    let cmd = null, prevType = null, lastCtrlX = 0, lastCtrlY = 0;
+    let firstPairOfCmd = true;
+    let i = 0;
+    const n = d.length;
+
+    while (i < n) {
+      const ch = d[i];
+      if (CMD_CHARS.indexOf(ch) !== -1) {
+        i += 1;
+        if (ch === "Z" || ch === "z") { // closes the sub-path right here: nothing follows a Z that it could wait for
+          if (h.close) h.close(cx, cy, startX, startY);
+          cx = startX; cy = startY; prevType = "Z"; cmd = null;
+          continue;
+        }
+        cmd = ch; firstPairOfCmd = true;
+        continue;
+      }
+      if (WS_RE.test(ch)) { i += 1; continue; }
+      if (cmd === null) { i += 1; continue; }
+
+      const upper = cmd.toUpperCase();
+      const isRel = cmd !== upper;
+      const group = [];
+      while (group.length < ARGC[upper]) {
+        NUM_RE.lastIndex = i;
+        const m = NUM_RE.exec(d);
+        if (!m) break;
+        group.push(parseNumber(m[0]));
+        i = NUM_RE.lastIndex;
+        while (i < n && WS_RE.test(d[i])) i += 1;
+      }
+      if (group.length < ARGC[upper]) break; // malformed tail: keep what was built so far
+
+      const type = upper === "M" && !firstPairOfCmd ? "L" : upper;
+      const absX = (v) => (isRel ? F(cx + v) : v);
+      const absY = (v) => (isRel ? F(cy + v) : v);
+      let nx, ny;
+
+      if (type === "M") {
+        nx = absX(group[0]); ny = absY(group[1]);
+        h.move(nx, ny);
+        startX = nx; startY = ny;
+      } else if (type === "L") {
+        nx = absX(group[0]); ny = absY(group[1]);
+        h.line(nx, ny);
+      } else if (type === "H") {
+        nx = absX(group[0]); ny = cy;
+        h.line(nx, ny);
+      } else if (type === "V") {
+        nx = cx; ny = absY(group[0]);
+        h.line(nx, ny);
+      } else if (type === "C") {
+        const x1 = absX(group[0]), y1 = absY(group[1]), x2 = absX(group[2]), y2 = absY(group[3]);
+        nx = absX(group[4]); ny = absY(group[5]);
+        h.cubic(cx, cy, x1, y1, x2, y2, nx, ny);
+        lastCtrlX = x2; lastCtrlY = y2;
+      } else if (type === "S") {
+        const x2 = absX(group[0]), y2 = absY(group[1]);
+        nx = absX(group[2]); ny = absY(group[3]);
+        const smooth = prevType === "C" || prevType === "S";
+        const x1 = smooth ? F(F(2 * cx) - lastCtrlX) : cx, y1 = smooth ? F(F(2 * cy) - lastCtrlY) : cy;
+        h.cubic(cx, cy, x1, y1, x2, y2, nx, ny);
+        lastCtrlX = x2; lastCtrlY = y2;
+      } else if (type === "Q") {
+        const x1 = absX(group[0]), y1 = absY(group[1]);
+        nx = absX(group[2]); ny = absY(group[3]);
+        h.quad(cx, cy, x1, y1, nx, ny);
+        lastCtrlX = x1; lastCtrlY = y1;
+      } else if (type === "T") {
+        nx = absX(group[0]); ny = absY(group[1]);
+        const smooth = prevType === "Q" || prevType === "T";
+        const x1 = smooth ? F(F(2 * cx) - lastCtrlX) : cx, y1 = smooth ? F(F(2 * cy) - lastCtrlY) : cy;
+        h.quad(cx, cy, x1, y1, nx, ny);
+        lastCtrlX = x1; lastCtrlY = y1;
+      } else { // A
+        nx = absX(group[5]); ny = absY(group[6]);
+        let px = cx, py = cy;
+        const drawn = arcTo(cx, cy, group[0], group[1], group[2], group[3] !== 0, group[4] !== 0, nx, ny,
+          (x1, y1, x2, y2, w) => { h.conic(px, py, x1, y1, x2, y2, w); px = x2; py = y2; });
+        if (!drawn) h.line(nx, ny);
+      }
+
+      prevType = type;
+      cx = nx; cy = ny;
+      firstPairOfCmd = false;
+    }
+  }
+
+  function pathBBox(d) {
     const empty = { x: 0, y: 0, width: 0, height: 0 };
     if (!d) return empty;
 
@@ -205,90 +297,103 @@ globalThis.__pathBBox = (function () {
       add(x3, y3);
     };
 
-    let cx = 0, cy = 0, startX = 0, startY = 0;
-    let cmd = null, prevType = null, lastCtrlX = 0, lastCtrlY = 0;
-    let firstPairOfCmd = true;
-    let i = 0;
-    const n = d.length;
-
-    while (i < n) {
-      const ch = d[i];
-      if (CMD_CHARS.indexOf(ch) !== -1) { cmd = ch; firstPairOfCmd = true; i += 1; continue; }
-      if (WS_RE.test(ch)) { i += 1; continue; }
-      if (cmd === null) { i += 1; continue; }
-      if (cmd === "Z" || cmd === "z") {
-        cx = startX; cy = startY; prevType = "Z"; cmd = null;
-        continue;
-      }
-
-      const upper = cmd.toUpperCase();
-      const isRel = cmd !== upper;
-      const group = [];
-      while (group.length < ARGC[upper]) {
-        NUM_RE.lastIndex = i;
-        const m = NUM_RE.exec(d);
-        if (!m) break;
-        group.push(parseNumber(m[0]));
-        i = NUM_RE.lastIndex;
-        while (i < n && WS_RE.test(d[i])) i += 1;
-      }
-      if (group.length < ARGC[upper]) break; // malformed tail: keep what was built so far
-
-      const type = upper === "M" && !firstPairOfCmd ? "L" : upper;
-      const absX = (v) => (isRel ? F(cx + v) : v);
-      const absY = (v) => (isRel ? F(cy + v) : v);
-      let nx, ny;
-
-      if (type === "M") {
-        nx = absX(group[0]); ny = absY(group[1]);
-        add(nx, ny);
-        startX = nx; startY = ny;
-      } else if (type === "L") {
-        nx = absX(group[0]); ny = absY(group[1]);
-        lineTo(nx, ny);
-      } else if (type === "H") {
-        nx = absX(group[0]); ny = cy;
-        lineTo(nx, ny);
-      } else if (type === "V") {
-        nx = cx; ny = absY(group[0]);
-        lineTo(nx, ny);
-      } else if (type === "C") {
-        const x1 = absX(group[0]), y1 = absY(group[1]), x2 = absX(group[2]), y2 = absY(group[3]);
-        nx = absX(group[4]); ny = absY(group[5]);
-        cubicTo(cx, cy, x1, y1, x2, y2, nx, ny);
-        lastCtrlX = x2; lastCtrlY = y2;
-      } else if (type === "S") {
-        const x2 = absX(group[0]), y2 = absY(group[1]);
-        nx = absX(group[2]); ny = absY(group[3]);
-        const smooth = prevType === "C" || prevType === "S";
-        const x1 = smooth ? F(F(2 * cx) - lastCtrlX) : cx, y1 = smooth ? F(F(2 * cy) - lastCtrlY) : cy;
-        cubicTo(cx, cy, x1, y1, x2, y2, nx, ny);
-        lastCtrlX = x2; lastCtrlY = y2;
-      } else if (type === "Q") {
-        const x1 = absX(group[0]), y1 = absY(group[1]);
-        nx = absX(group[2]); ny = absY(group[3]);
-        quadTo(cx, cy, x1, y1, nx, ny);
-        lastCtrlX = x1; lastCtrlY = y1;
-      } else if (type === "T") {
-        nx = absX(group[0]); ny = absY(group[1]);
-        const smooth = prevType === "Q" || prevType === "T";
-        const x1 = smooth ? F(F(2 * cx) - lastCtrlX) : cx, y1 = smooth ? F(F(2 * cy) - lastCtrlY) : cy;
-        quadTo(cx, cy, x1, y1, nx, ny);
-        lastCtrlX = x1; lastCtrlY = y1;
-      } else { // A
-        nx = absX(group[5]); ny = absY(group[6]);
-        let px = cx, py = cy;
-        const drawn = arcTo(cx, cy, group[0], group[1], group[2], group[3] !== 0, group[4] !== 0, nx, ny,
-          (x1, y1, x2, y2, w) => { conicTo(px, py, x1, y1, x2, y2, w); px = x2; py = y2; });
-        if (!drawn) lineTo(nx, ny);
-      }
-
-      prevType = type;
-      cx = nx; cy = ny;
-      firstPairOfCmd = false;
-    }
+    walk(d, { move: add, line: lineTo, quad: quadTo, conic: conicTo, cubic: cubicTo });
 
     if (minX !== minX) return empty;
     return { x: minX, y: minY, width: F(maxX - minX), height: F(maxY - minY) };
+  }
+
+  // ---- getTotalLength ------------------------------------------------------------------------------------
+  //
+  // Chrome's answer is the true arc length to within float32 noise (measured against Chrome 153 on every distinct
+  // `d` in tests/samples, see tests/data/chrome_path_length.json): a Q/C segment of 11.36 px is off by 1e-6, one
+  // of 11362 px by 1e-3. That rules out Skia's default SkContourMeasure (resScale 1, tolerance 0.5), which stops
+  // halving a curve once it is within half a pixel of its chord and so comes out ~0.6 px short on every rounded
+  // corner. The exact formula Blink uses is not known; this is the same halving scheme (de Casteljau at t = 1/2,
+  // t as a 30-bit fixed point fraction, chords summed in float32) run until the curve is flat to 1/2048 px.
+  // Exact for straight lines and within ~1e-5 relative for curves, far below any rendering difference.
+  const TOLERANCE = 0.5 / 1024;
+  const dist = (x0, y0, x1, y1) => {
+    const dx = F(x1 - x0), dy = F(y1 - y0);
+    return F(Math.sqrt(F(F(dx * dx) + F(dy * dy))));
   };
+  const halfLerp = (a, b) => F(a + F(F(b - a) * 0.5)); // SkScalarInterp(a, b, 0.5), exact in float32
+  const tSpanBigEnough = (span) => (span >> 10) !== 0;
+
+  function quadTooCurvy(x0, y0, x1, y1, x2, y2) {
+    const dx = F(F(x1 * 0.5) - F(F(F(x0 + x2)) * 0.25));
+    const dy = F(F(y1 * 0.5) - F(F(F(y0 + y2)) * 0.25));
+    return Math.max(Math.abs(dx), Math.abs(dy)) > TOLERANCE;
+  }
+
+  function cubicTooCurvy(x0, y0, x1, y1, x2, y2, x3, y3) {
+    const third = F(1 / 3), twoThirds = F(F(2) / 3);
+    const lerp = (a, b, t) => F(a + F(F(b - a) * t));
+    const exceeds = (px, py, x, y) => Math.max(Math.abs(F(x - px)), Math.abs(F(y - py))) > TOLERANCE;
+    return exceeds(x1, y1, lerp(x0, x3, third), lerp(y0, y3, third)) ||
+           exceeds(x2, y2, lerp(x0, x3, twoThirds), lerp(y0, y3, twoThirds));
+  }
+
+  function pathLength(d) {
+    if (!d) return 0;
+    const K_MAX_T = 0x3FFFFFFF;
+    let total = 0, curX = 0, curY = 0;
+    const addChord = (x0, y0, x1, y1) => {
+      const next = F(total + dist(x0, y0, x1, y1));
+      if (next > total) total = next; // Skia drops zero-length segments
+    };
+    const quadSegs = (x0, y0, x1, y1, x2, y2, mint, maxt) => {
+      if (tSpanBigEnough(maxt - mint) && quadTooCurvy(x0, y0, x1, y1, x2, y2)) {
+        const ax = halfLerp(x0, x1), ay = halfLerp(y0, y1), bx = halfLerp(x1, x2), by = halfLerp(y1, y2);
+        const mx = halfLerp(ax, bx), my = halfLerp(ay, by);
+        const half = (mint + maxt) >> 1;
+        quadSegs(x0, y0, ax, ay, mx, my, mint, half);
+        quadSegs(mx, my, bx, by, x2, y2, half, maxt);
+      } else {
+        addChord(x0, y0, x2, y2);
+      }
+    };
+    const cubicSegs = (x0, y0, x1, y1, x2, y2, x3, y3, mint, maxt) => {
+      if (tSpanBigEnough(maxt - mint) && cubicTooCurvy(x0, y0, x1, y1, x2, y2, x3, y3)) {
+        const abx = halfLerp(x0, x1), aby = halfLerp(y0, y1);
+        const bcx = halfLerp(x1, x2), bcy = halfLerp(y1, y2);
+        const cdx = halfLerp(x2, x3), cdy = halfLerp(y2, y3);
+        const abcx = halfLerp(abx, bcx), abcy = halfLerp(aby, bcy);
+        const bcdx = halfLerp(bcx, cdx), bcdy = halfLerp(bcy, cdy);
+        const mx = halfLerp(abcx, bcdx), my = halfLerp(abcy, bcdy);
+        const half = (mint + maxt) >> 1;
+        cubicSegs(x0, y0, abx, aby, abcx, abcy, mx, my, mint, half);
+        cubicSegs(mx, my, bcdx, bcdy, cdx, cdy, x3, y3, half, maxt);
+      } else {
+        addChord(x0, y0, x3, y3);
+      }
+    };
+
+    walk(d, {
+      move(x, y) { curX = x; curY = y; },
+      line(x, y) { addChord(curX, curY, x, y); curX = x; curY = y; },
+      quad(x0, y0, x1, y1, x2, y2) { quadSegs(x0, y0, x1, y1, x2, y2, 0, K_MAX_T); curX = x2; curY = y2; },
+      cubic(x0, y0, x1, y1, x2, y2, x3, y3) {
+        cubicSegs(x0, y0, x1, y1, x2, y2, x3, y3, 0, K_MAX_T); curX = x3; curY = y3;
+      },
+      // Elliptical arcs reach here as conics. Skia measures them through a quad approximation of its own; a
+      // dense evaluation of the conic is within a hair of that and arcs are rare in mermaid output.
+      conic(x0, y0, x1, y1, x2, y2, w) {
+        const N = 256;
+        let px = x0, py = y0;
+        for (let i = 1; i <= N; i++) {
+          const t = i / N;
+          const x = evalConic(x0, x1, x2, w, t), y = evalConic(y0, y1, y2, w, t);
+          addChord(px, py, x, y);
+          px = x; py = y;
+        }
+        curX = x2; curY = y2;
+      },
+      close(cx, cy, sx, sy) { addChord(cx, cy, sx, sy); curX = sx; curY = sy; },
+    });
+    return total;
+  }
+  globalThis.__pathLength = pathLength;
+
+  return pathBBox;
 })();

@@ -17,7 +17,7 @@ def test_both_engines_raise_the_same_error_class():
 
 def test_config_defaults_and_caller_wins():
     cfg = _common.mermaid_config(None, None)
-    assert cfg["startOnLoad"] is False and cfg["theme"] == "default"
+    assert cfg["startOnLoad"] is False and "theme" not in cfg  # mermaid.js picks its own default, like mmdc
     assert cfg["flowchart"] == {"htmlLabels": True}
     assert cfg["journey"] == {"textPlacement": "fo"} and cfg["timeline"] == {"textPlacement": "fo"}
 

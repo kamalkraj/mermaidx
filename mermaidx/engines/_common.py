@@ -48,14 +48,18 @@ def mermaid_config(theme: Optional[str], config: Optional[dict]) -> dict:
 
     htmlLabels / textPlacement="fo" are mermaid.js's own defaults, set explicitly so they are the same whatever
     mermaid's version does: the label markup is real HTML in a <foreignObject>, which the shim sizes and novasvg
-    paints. Any key the caller passes wins over these defaults."""
+    paints. Any key the caller passes wins over these defaults.
+
+    No theme is sent unless one was asked for, so mermaid.js picks its own default exactly as mermaid-cli does when
+    ``-t`` is not given. Forcing "default" is *not* the same thing since mermaid 12, whose own default is "neo"."""
     cfg = {
         "startOnLoad": False,
-        "theme": theme or "default",
         "flowchart": {"htmlLabels": True},
         "journey": {"textPlacement": "fo"},
         "timeline": {"textPlacement": "fo"},
     }
+    if theme:
+        cfg["theme"] = theme
     if config:
         cfg.update(config)
     return cfg

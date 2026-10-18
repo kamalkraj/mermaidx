@@ -348,3 +348,12 @@ def test_issue_31_journey_task_labels_not_missing():
         region = rgba[int(y) + 2:int(y + h) - 2, int(x) + 2:int(x + w) - 2]
         dark = ((region[:, :, 3] > 0) & (region[:, :, :3].sum(axis=2) < 300)).sum()
         assert dark > 10, f"box at ({x},{y}) {w}x{h} has no painted label text"
+
+
+def test_requirement_diagram_label_with_escaped_angle_brackets_survives_sanitizing():
+    """mermaid.render() ends in DOMPurify. Text like the `<<Element>>` stereotype used to make it drop the whole
+    <svg> (see test_dom_shim: nodeType accessor), which surfaced as `cannot read property 'style' of undefined`."""
+    import mermaidx
+
+    svg = mermaidx.render("requirementDiagram\n  element e {\n    type: sim\n  }").svg()
+    assert "<svg" in svg and "&lt;&lt;Element&gt;&gt;" in svg

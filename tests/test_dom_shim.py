@@ -1398,3 +1398,62 @@ def test_a_frame_loop_that_never_stops_is_bounded_by_the_engine_not_the_page():
     for _ in range(50):
         assert ctx.eval("__runNextTimer()") is True
     assert ctx.eval("frames") == 50
+
+
+def test_get_total_length_exists_only_on_paths():
+    """mermaid 12 probes `typeof el.getTotalLength == "function"` before sizing a neo edge's stroke-dasharray, so
+    the method must be there on <path> (and return the length) and stay undefined everywhere else."""
+    ctx = _make_ctx()
+    out = ctx.eval("""(() => {
+      const ns = "http://www.w3.org/2000/svg";
+      const p = document.createElementNS(ns, "path"); p.setAttribute("d", "M0,0L3,4");
+      const g = document.createElementNS(ns, "g"), div = document.createElement("div");
+      return JSON.stringify([typeof p.getTotalLength, p.getTotalLength(), typeof g.getTotalLength, typeof div.getTotalLength]);
+    })()""")
+    assert json.loads(out) == ["function", 5, "undefined", "undefined"]
+
+
+def test_css_style_sheet_rules_are_live_style_rules():
+    """mermaid 12's C4 renderer inserts an empty rule, fills it through `rule.style.setProperty(...)`, keeps the
+    ones with `style.length > 0` and prints their `cssText`."""
+    ctx = _make_ctx()
+    out = ctx.eval("""(() => {
+      const sheet = new CSSStyleSheet();
+      const rule = sheet.cssRules[sheet.insertRule(".c4-shape.c4-person .label {}", sheet.cssRules.length)];
+      const emptyLen = rule.style.length, emptyText = rule.cssText;
+      rule.style.setProperty("font-size", "12px");
+      rule.style.setProperty("font-family", "Arial");
+      const full = [rule.style.length, rule.cssText, rule.style.getPropertyValue("font-size")];
+      rule.style.removeProperty("font-size");
+      return JSON.stringify([emptyLen, emptyText, full, rule.style.length]);
+    })()""")
+    empty_len, empty_text, full, after = json.loads(out)
+    assert empty_len == 0 and empty_text == ".c4-shape.c4-person .label { }"
+    assert full == [2, ".c4-shape.c4-person .label { font-size: 12px; font-family: Arial; }", "12px"]
+    assert after == 1
+
+
+def test_node_type_is_a_prototype_accessor_like_in_a_browser():
+    """DOMPurify's isNode() calls the getter it finds on Node.prototype ("nodeType"). A shim that only had a
+    per-instance property made it false for every node, and its mXSS guard then removed any <svg> whose text
+    contained "<x" (the escaped `<<Element>>` label of a requirement diagram), so render() returned ''."""
+    ctx = _make_ctx()
+    out = ctx.eval("""(() => {
+      const get = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType").get;
+      const el = document.createElement("div"), txt = document.createTextNode("x");
+      return JSON.stringify([typeof get, get.call(el), get.call(txt), el.nodeType, txt.nodeType, document.nodeType]);
+    })()""")
+    assert json.loads(out) == ["function", 1, 3, 1, 3, 9]
+
+
+def test_owner_svg_element_is_the_nearest_ancestor_svg():
+    """mermaid names its drop-shadow filter `${node.ownerSVGElement.id}-drop-shadow-small` (state diagrams)."""
+    ctx = _make_ctx()
+    out = ctx.eval("""(() => {
+      const ns = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(ns, "svg"); svg.setAttribute("id", "my-svg");
+      const g = document.createElementNS(ns, "g"), c = document.createElementNS(ns, "circle");
+      svg.appendChild(g); g.appendChild(c);
+      return JSON.stringify([c.ownerSVGElement.id, g.ownerSVGElement.id, svg.ownerSVGElement, typeof document.createElement("div").ownerSVGElement]);
+    })()""")
+    assert json.loads(out) == ["my-svg", "my-svg", None, "undefined"]
